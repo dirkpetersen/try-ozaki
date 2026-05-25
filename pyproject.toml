@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "try-ozaki"
+version = "0.1.0"
+description = "Automated FP64 → Ozaki Scheme rewrite and GPU validation"
+requires-python = ">=3.12"
+dependencies = [
+    "boto3",
+    "pytest",
+]
+
+[project.scripts]
+try-ozaki = "try_ozaki.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["try_ozaki*"]

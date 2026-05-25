@@ -50,7 +50,16 @@ Modeled on `~/gh/codecheck`. Key patterns to follow from that repo:
 
 ### Result transfer (worker → app host)
 
-GPU worker writes output tensors, timing data, and logs to a **single shared S3 bucket**, with objects keyed by `<job-id>/...`. The app host reads from S3 to perform validation and serve results.
+GPU worker writes output tensors, timing data, and logs via a **Run:ai S3 datasource** that is pre-configured in the cluster and mounted into every job container automatically. No AWS credentials are injected into worker containers.
+
+**Run:ai S3 datasource: `runai-peterdir`**
+- Datasource name: `runai-peterdir` (scope: Project `osu-default`)
+- Backing bucket: `s3://runai-peterdir` (region: `us-east-1`)
+- Mount path inside container: `/mnt/runai-peterdir`
+- Attached to every job via: `--datasource type=s3,name=runai-peterdir`
+- The app host uploads job scripts and source archives to `s3://runai-peterdir/try-ozaki-jobs/<job-id>/` using its own AWS credentials (profile `dirkcli`, `us-east-1`)
+- The worker reads from `/mnt/runai-peterdir/try-ozaki-jobs/<job-id>/` and writes results back to the same mount path
+- The app host then reads results from S3 directly to validate
 
 ### Cluster backends
 
@@ -59,8 +68,9 @@ GPU worker writes output tensors, timing data, and logs to a **single shared S3 
 - Host machine needs SSH access to the Run:ai login node
 - Users must authenticate (`runai login`) on the host before running `try-ozaki`
 - Run:ai project/namespace is **configurable per job submission**, default: `osu-default`
-- Worker container image: `nvcr.io/nvidia/cuda:13.x-devel-ubuntu24.04`
+- Worker container image: `nvcr.io/nvidia/cuda:12.4.1-devel-ubuntu22.04`
 - Jobs submitted programmatically via the CLI from within the app process
+- S3 datasource `runai-peterdir` is attached to every job — no AWS key injection needed in containers
 
 **SLURM (optional)**
 - Disabled by default; enabled via config/env var

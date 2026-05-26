@@ -35,8 +35,15 @@ def _s3_download(bucket: str, key: str, local: Path, region: str = "us-east-1") 
 
 
 def _parse_floats(text: str) -> list[float]:
-    """Extract all floating-point numbers from text output."""
-    return [float(m) for m in re.findall(r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?", text)]
+    """Extract floats from RESULT: lines only.
+
+    Programs emit:  RESULT C11= <val>  CNN= <val>  sum= <val>
+    Comparing only these lines avoids false errors from different timing numbers.
+    Falls back to all floats in the output if no RESULT: lines are found.
+    """
+    result_lines = [l for l in text.splitlines() if l.startswith("RESULT")]
+    source = "\n".join(result_lines) if result_lines else text
+    return [float(m) for m in re.findall(r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?", source)]
 
 
 def collect(

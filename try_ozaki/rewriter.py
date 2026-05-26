@@ -148,7 +148,10 @@ def _write_wrapper_once(dest_dir: Path, lang: str) -> None:
 
 
 def _add_use_statement(lines: list[str], module: str) -> list[str]:
-    """Insert 'use <module>' after the first 'implicit none' or program/subroutine/function line."""
+    """Insert 'use <module>' after the first program/subroutine/function line, idempotent."""
+    # Skip if already present
+    if any(re.match(rf"^\s*use\s+{re.escape(module)}\b", l, re.IGNORECASE) for l in lines):
+        return lines
     for i, line in enumerate(lines):
         if re.match(r"^\s*implicit\s+none\b", line, re.IGNORECASE):
             lines.insert(i, f"  use {module}\n")
@@ -247,20 +250,38 @@ def rewrite(repo_dir: Path, hotspots: list[Hotspot]) -> list[Path]:
         by_file[h.file].append(h)
 
     for file_path, hs in by_file.items():
-        # Sort hotspots bottom-up so line number edits don't shift later ones
-        hs_sorted = sorted(hs, key=lambda h: h.start_line, reverse=True)
         lines = file_path.read_text(errors="replace").splitlines(keepends=True)
 
-        for h in hs_sorted:
+        # dgemm_call: single-line replacements — do all substitutions first (top-down),
+        # then insert the 'use' statement once.  loop_nest: bottom-up (block edits).
+        dgemm_hs = [h for h in hs if h.kind in ("dgemm_call", "dgemv_call")]
+        block_hs = sorted(
+            [h for h in hs if h.kind not in ("dgemm_call", "dgemv_call")],
+            key=lambda h: h.start_line, reverse=True,
+        )
+
+        need_use = False
+        for h in sorted(dgemm_hs, key=lambda h: h.start_line):
             lang = h.language
             if lang == "fortran":
-                if h.kind == "dgemm_call":
-                    lines = _rewrite_fortran_dgemm(lines, h)
-                elif h.kind == "loop_nest":
-                    lines = _rewrite_fortran_loop(lines, h)
+                ln = h.start_line - 1
+                lines[ln] = re.sub(r"\bDGEMM\s*\(", "OZAKI_DGEMM(", lines[ln], flags=re.IGNORECASE)
+                need_use = True
+                if lang not in written_wrappers:
+                    _write_wrapper_once(file_path.parent, lang)
+                    written_wrappers.add(lang)
             elif lang in ("c", "cpp"):
-                if h.kind in ("dgemm_call", "dgemv_call"):
-                    lines = _rewrite_c_dgemm(lines, h)
+                lines = _rewrite_c_dgemm(lines, h)
+                if lang not in written_wrappers:
+                    _write_wrapper_once(file_path.parent, lang)
+                    written_wrappers.add(lang)
+        if need_use:
+            lines = _add_use_statement(lines, "ozaki_wrapper")
+
+        for h in block_hs:
+            lang = h.language
+            if lang == "fortran" and h.kind == "loop_nest":
+                lines = _rewrite_fortran_loop(lines, h)
 
             if lang not in written_wrappers:
                 _write_wrapper_once(file_path.parent, lang)

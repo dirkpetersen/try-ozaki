@@ -186,31 +186,32 @@ OZAKI_SIMPLE = EXAMPLES_DIR / "ozaki-simple"
 
 
 def test_ozaki_simple_analyzed():
-    """examples/ozaki-simple contains exactly one FP64 triple-nested loop."""
+    """examples/ozaki-simple contains FP64 DGEMM calls (no longer a loop — uses cuBLAS)."""
     assert OZAKI_SIMPLE.is_dir(), f"examples/ozaki-simple not found at {OZAKI_SIMPLE}"
     hotspots = analyze(OZAKI_SIMPLE)
     assert len(hotspots) >= 1, f"Expected ≥1 hotspot in ozaki-simple, got {hotspots}"
     kinds = {h.kind for h in hotspots}
-    assert "loop_nest" in kinds, f"Expected loop_nest, got {kinds}"
+    assert "dgemm_call" in kinds, f"Expected dgemm_call, got {kinds}"
     langs = {h.language for h in hotspots}
     assert "fortran" in langs
 
 
 def test_ozaki_simple_rewritten(tmp_path):
-    """Rewriting ozaki-simple produces an OZAKI_DGEMM call (not a TODO)."""
+    """Rewriting ozaki-simple replaces DGEMM calls with OZAKI_DGEMM and generates wrappers."""
     work = tmp_path / "ozaki-simple"
     shutil.copytree(OZAKI_SIMPLE, work)
     hotspots = analyze(work)
     modified = rewrite(work, hotspots)
 
     assert len(modified) >= 1
-    assert (work / "ozaki_wrapper.f90").exists()
+    assert (work / "ozaki_wrapper.f90").exists(), "ozaki_wrapper.f90 not generated"
+    assert (work / "ozaki_wrapper.cpp").exists(), "ozaki_wrapper.cpp not generated"
 
     src = (work / "matmul_fp64.f90").read_text()
     assert "OZAKI_DGEMM" in src, "Expected OZAKI_DGEMM call in rewritten file"
-    assert "try-ozaki" in src
-    # Original loop should be commented out
-    assert "! [try-ozaki] Original FP64 triple-nested loop" in src
+    assert "use ozaki_wrapper" in src
+    # Only one use statement (idempotent)
+    assert src.count("use ozaki_wrapper") == 1, "Duplicate use ozaki_wrapper inserted"
 
 
 def test_ozaki_simple_cli_no_submit():

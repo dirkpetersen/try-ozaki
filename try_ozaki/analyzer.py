@@ -55,12 +55,13 @@ def _fortran_hotspots(path: Path) -> list[Hotspot]:
     # Find DGEMM/DGEMV calls
     for i, line in enumerate(lines):
         if _F_DGEMM.search(line):
+            # i is the 0-based index of the actual "call dgemm" line
             ctx = "\n".join(lines[max(0, i-2):i+6])
             hotspots.append(Hotspot(
                 file=path, kind="dgemm_call", language="fortran",
                 start_line=i+1, end_line=i+1, context=ctx, vars=double_vars,
             ))
-        if _F_DGEMV.search(line):
+        elif _F_DGEMV.search(line):
             ctx = "\n".join(lines[max(0, i-2):i+4])
             hotspots.append(Hotspot(
                 file=path, kind="dgemv_call", language="fortran",
@@ -188,6 +189,9 @@ def analyze(repo_dir: Path) -> list[Hotspot]:
 
     for path in sorted(repo_dir.rglob("*")):
         if not path.is_file():
+            continue
+        # Skip generated/wrapper files produced by a previous rewrite pass
+        if path.name in ("ozaki_wrapper.f90", "ozaki_wrapper.cpp", "gpu_dgemm.cu"):
             continue
         lang = _LANG_EXTS.get(path.suffix) or _LANG_EXTS.get(path.name.split(".")[-1], "")
         if not lang:

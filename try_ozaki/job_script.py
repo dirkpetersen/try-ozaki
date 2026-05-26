@@ -50,16 +50,22 @@ log "apt done: cmake=$(cmake --version 2>/dev/null | head -1), gfortran=$(gfortr
 # ── Clone and build ozIMMU ─────────────────────────────────────────────────
 # ozIMMU requires CUDA dev headers; build is best-effort
 if [ ! -f "/usr/local/lib/libozIMMU.so" ] && [ ! -f "/usr/local/lib/libozIMMU.a" ]; then
-    log "Cloning ozIMMU from @OZIMMU_REPO@..."
+    log "Cloning ozIMMU and its dependencies..."
     git clone --depth=1 @OZIMMU_REPO@ "$OZIMMU_DIR" >> "$LOGFILE" 2>&1 || { log "WARNING: ozIMMU clone failed."; }
+    # cutf is a header-only dependency; ozIMMU CMakeLists looks for it at src/cutf/include
+    git clone --depth=1 https://github.com/wmmae/cutf "$OZIMMU_DIR/src/cutf" >> "$LOGFILE" 2>&1 \
+        || { log "WARNING: cutf clone failed."; }
     if [ -d "$OZIMMU_DIR" ]; then
         log "Building ozIMMU..."
         cmake -S "$OZIMMU_DIR" -B "$OZIMMU_DIR/build" \\
             -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local \\
-            -DCMAKE_CUDA_FLAGS="-L/usr/local/cuda/lib64" >> "$LOGFILE" 2>&1 \\
+            -DAUTO_SUBMODULE_UPDATE=OFF \\
+            -DBUILD_TEST=OFF \\
+            >> "$LOGFILE" 2>&1 \\
             && cmake --build "$OZIMMU_DIR/build" -j$(nproc) >> "$LOGFILE" 2>&1 \\
             && cmake --install "$OZIMMU_DIR/build" >> "$LOGFILE" 2>&1 \\
             && echo '/usr/local/cuda/lib64' > /etc/ld.so.conf.d/cuda-ozaki.conf \\
+            && echo '/usr/local/lib' >> /etc/ld.so.conf.d/cuda-ozaki.conf \\
             && ldconfig >> "$LOGFILE" 2>&1 \\
             && log "ozIMMU installed and ldconfig updated." \\
             || log "WARNING: ozIMMU build failed (Ozaki binary will not be available)."

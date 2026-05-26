@@ -43,7 +43,7 @@ log "Installing build dependencies (apt)..."
 # Use || true so apt repo errors (e.g. CUDA keyring) don't abort the job
 apt-get update 2>&1 | tail -3 >> "$LOGFILE" || true
 DEBIAN_FRONTEND=noninteractive apt-get install -y \\
-    cmake gfortran libopenblas-dev libopenblas-base git \\
+    cmake gfortran g++ libopenblas-dev libopenblas-base git \\
     >> "$LOGFILE" 2>&1
 log "apt done: cmake=$(cmake --version 2>/dev/null | head -1), gfortran=$(gfortran --version 2>/dev/null | head -1)"
 
@@ -55,10 +55,13 @@ if [ ! -f "/usr/local/lib/libozIMMU.so" ] && [ ! -f "/usr/local/lib/libozIMMU.a"
     if [ -d "$OZIMMU_DIR" ]; then
         log "Building ozIMMU..."
         cmake -S "$OZIMMU_DIR" -B "$OZIMMU_DIR/build" \\
-            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local >> "$LOGFILE" 2>&1 \\
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local \\
+            -DCMAKE_CUDA_FLAGS="-L/usr/local/cuda/lib64" >> "$LOGFILE" 2>&1 \\
             && cmake --build "$OZIMMU_DIR/build" -j$(nproc) >> "$LOGFILE" 2>&1 \\
             && cmake --install "$OZIMMU_DIR/build" >> "$LOGFILE" 2>&1 \\
-            && log "ozIMMU installed." \\
+            && echo '/usr/local/cuda/lib64' > /etc/ld.so.conf.d/cuda-ozaki.conf \\
+            && ldconfig >> "$LOGFILE" 2>&1 \\
+            && log "ozIMMU installed and ldconfig updated." \\
             || log "WARNING: ozIMMU build failed (Ozaki binary will not be available)."
     fi
 else
@@ -90,7 +93,8 @@ log "Building Ozaki-rewritten binary..."
 mkdir -p "$WORKDIR/build_ozaki"
 cmake -S "$SRCDIR/ozaki" -B "$WORKDIR/build_ozaki" \\
     -DCMAKE_BUILD_TYPE=Release $CMAKE_FLAGS \\
-    -DUSE_OZAKI=ON -DOZIMMU_DIR=/usr/local >> "$LOGFILE" 2>&1 \\
+    -DUSE_OZAKI=ON -DOZIMMU_DIR=/usr/local \\
+    -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64 -L/usr/local/lib -Wl,-rpath,/usr/local/cuda/lib64:/usr/local/lib" >> "$LOGFILE" 2>&1 \\
     && cmake --build "$WORKDIR/build_ozaki" -j$(nproc) >> "$LOGFILE" 2>&1 \\
     && log "Ozaki build OK." \\
     || log "WARNING: Ozaki build failed (ozIMMU may not support this code yet)."

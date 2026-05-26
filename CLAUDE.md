@@ -68,7 +68,7 @@ GPU worker writes output tensors, timing data, and logs via a **Run:ai S3 dataso
 - Host machine needs SSH access to the Run:ai login node
 - Users must authenticate (`runai login`) on the host before running `try-ozaki`
 - Run:ai project/namespace is **configurable per job submission**, default: `osu-default`
-- Worker container image: `nvcr.io/nvidia/cuda:12.4.1-devel-ubuntu22.04`
+- Worker container image: `nvcr.io/nvidia/cuda:13.2.1-devel-ubuntu24.04` (CUDA 13.2 Update 1, June 2026)
 - Jobs submitted programmatically via the CLI from within the app process
 - S3 datasource `runai-peterdir` is attached to every job — no AWS key injection needed in containers
 

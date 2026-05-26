@@ -66,11 +66,61 @@ The trajectory of the FP64/INT8 ratio strongly suggests these speedup factors wi
 
 ## 4. The CUDA 13.0 Update 2 turning point (October 2025)
 
-The NVIDIA blog post linked above changes the picture significantly. As of CUDA 13.0 Update 2, **cuBLAS itself implements the Ozaki Scheme natively** for FP64 matmul on supported hardware (GB200 NVL72, RTX PRO 6000 Blackwell, with more to follow):
+The NVIDIA blog post and the [official cuBLAS documentation](https://docs.nvidia.com/cuda/cublas/#floating-point-emulation) change the picture significantly. As of CUDA 13.0 Update 2, **cuBLAS itself implements the Ozaki Scheme natively** for FP64 matmul.
 
-- cuBLAS exposes an **Automatic Dynamic Precision (ADP) framework** that analyzes input matrices, picks the optimal slice count, and decides between native FP64 and emulated FP64 — automatically, with no source code changes.
-- The default ADP guarantees accuracy **equal to or better than native FP64**.
-- Users can optionally tune mantissa bits down (e.g. 55 / 47 / 39) to trade accuracy for further speedup.
+### Hardware support (correction — broader than the blog post implied)
+
+The cuBLAS documentation specifies the actual compute-capability matrix:
+
+| Emulation type      | Supported CCs                       | Includes (notable)                         | CUDA version |
+|---------------------|-------------------------------------|--------------------------------------------|--------------|
+| BF16x9 (FP32 emul.) | 10.0, 10.3                          | Blackwell only                             | 12.9+        |
+| Fixed-Point (FP64)  | **8.x, 9.0, 10.0, 11.0, 12.x**      | **A100, H100, H200**, Blackwell, future    | 13.0u2+      |
+
+This is the surprise: **FP64 emulation works on H100 and H200** (CC 9.0) and even **A100** (CC 8.0). The blog post features Blackwell because that's where the new hardware lives, but the implementation reaches back at least to Ampere. Our own H200 cluster qualifies — we just need to use the cuBLAS API instead of (or in addition to) ozIMMU directly.
+
+### The cuBLAS emulation API
+
+```c
+// Math-mode flag for typed GEMM functions
+cublasSetMathMode(handle, CUBLAS_FP64_EMULATED_FIXEDPOINT_MATH);
+
+// Or set the compute type on cublasGemmEx() calls directly:
+//   computeType = CUBLAS_COMPUTE_64F_EMULATED_FIXEDPOINT
+
+// Mantissa control (the key tuning knob)
+cublasSetFixedPointEmulationMantissaControl(handle, CUBLAS_DYNAMIC_MANTISSA);  // ADP (default)
+cublasSetFixedPointEmulationMaxMantissaBitCount(handle, 55);                   // tighter ceiling
+cublasSetFixedPointEmulationMantissaBitOffset(handle, ...);                    // performance tuning
+
+// Performance vs. eager strategy
+cublasSetEmulationStrategy(handle, /* performant | eager */);
+
+// Special values (Inf/NaN) handling
+cublasSetEmulationSpecialValuesSupport(handle, ...);
+```
+
+Or with no code changes at all, via environment variables:
+
+- `CUBLAS_EMULATE_DOUBLE_PRECISION=1` — turn on FP64 emulation globally
+- `CUBLAS_EMULATION_STRATEGY=performant` (or `eager`)
+- `CUBLAS_FIXEDPOINT_EMULATION_MANTISSA_BIT_COUNT=55`
+
+This means a user with an existing CUDA application that calls `cublasDgemm` can pick up Ozaki emulation by **setting an environment variable** before the binary launches, with no recompile. This is the lowest-effort path to the speedup.
+
+### Mantissa control modes
+
+Two control modes are exposed:
+
+- **Dynamic mantissa control (default)** — the ADP framework analyzes inputs and picks the bit count needed for accuracy ≥ native FP64. Default ceiling: **79 mantissa bits**. Falls back to native FP64 if the matrix exponent range demands more bits than the ceiling allows.
+- **Fixed mantissa control** — user pins a specific bit count (default 55). No fallback; pure performance/accuracy trade.
+
+### Supported routines
+
+FP emulation activates for:
+
+- `cublasGemmEx()`, `cublasGemmBatchedEx()`, `cublasGemmStridedBatchedEx()`
+- Typed-API GEMM (e.g. `cublasDgemm`) when `cublasSetMathMode()` is configured
 
 Reported real-application results from NVIDIA:
 
@@ -80,9 +130,17 @@ Reported real-application results from NVIDIA:
 | BerkeleyGW       | B200                    | Significant ZGEMM speedup        |
 | Quantum ESPRESSO | RTX PRO 6000 Blackwell  | 1.5× (ADP), ~3× (39 mantissa)    |
 
-Heat maps in the blog show 2.3× to 13× DGEMM speedups across a wide range of matrix shapes, with no penalty on small matrices (cuBLAS heuristics fall back to native FP64).
+Heat maps in the blog show 2.3× DGEMM speedup on GB200 and **up to 13× on RTX PRO 6000 Blackwell**, across a wide range of matrix shapes, with no penalty on small matrices (cuBLAS heuristics fall back to native FP64).
 
-**This is the Ozaki Scheme arriving as a vendor-supported, drop-in capability for any code that already calls cuBLAS DGEMM/ZGEMM.**
+### Known limitations of cuBLAS FP emulation
+
+From the official documentation:
+
+- **Bit-wise reproducibility is not guaranteed** with fixed-point emulation due to dynamic workspace allocation.
+- **Large workspace requirements** — provide a pre-allocated workspace via `cublasSetWorkspace()` for best performance.
+- **Not supported during CUDA Graph stream capture** without a pre-allocated workspace.
+
+**This is the Ozaki Scheme arriving as a vendor-supported, drop-in capability for any code that already calls cuBLAS DGEMM/ZGEMM on Ampere, Hopper, or Blackwell.**
 
 ---
 
@@ -106,7 +164,7 @@ But several large categories of scientific code do **not** fall into that bucket
 
 2. **Code calling CPU BLAS implementations** (Netlib reference, OpenBLAS, MKL CPU, ATLAS). These never touch a GPU. cuBLAS FP emulation is irrelevant until the call site is redirected.
 
-3. **Code calling cuBLAS on non-Blackwell hardware.** As of CUDA 13.0 Update 2, FP64 emulation is supported on GB200 NVL72 and RTX PRO 6000 Blackwell. Users on H100, H200, A100, V100, and consumer Ampere/Ada cards get nothing automatically. Older clusters need the manual integration path.
+3. **Code calling cuBLAS on hardware older than Ampere (V100, T4, P100, etc.).** The cuBLAS FP64 emulation supports compute capabilities 8.x and above (Ampere, Hopper, Blackwell, future), so A100 / H100 / H200 users *can* benefit just by upgrading CUDA. But Volta-class HPC clusters (V100) and older are excluded — they need the manual ozIMMU path or a hardware refresh. Pre-CUDA-13.0-U2 deployments also need the manual path until they upgrade.
 
 4. **Code using GEMM implementations other than cuBLAS:** MAGMA, custom CUDA kernels, hipBLAS on AMD, oneAPI on Intel. None of these inherit the cuBLAS ADP framework.
 
@@ -156,7 +214,10 @@ What we built so far validates **the second half** of this end-to-end on a real 
    - Older CUDA versions (< 13.0U2)
    - Codes that need precision-tuning beyond what cuBLAS ADP exposes
 
-5. **Add CUDA version detection** to the worker job script. If `cuBLAS >= 13.0U2` and hardware is Blackwell, recommend just upgrading CUDA. Otherwise, fall through to the explicit Ozaki path.
+5. **Add CUDA version + compute-capability detection** to the worker job script. The decision matrix is now:
+   - CUDA ≥ 13.0u2 **and** GPU CC ≥ 8.0 (Ampere or newer): just enable cuBLAS FP emulation via `cublasSetMathMode(CUBLAS_FP64_EMULATED_FIXEDPOINT_MATH)` or `CUBLAS_EMULATE_DOUBLE_PRECISION=1`. No source rewrite beyond routing through cuBLAS.
+   - CUDA < 13.0u2 **or** GPU CC < 8.0 (Volta, Pascal): fall through to the explicit ozIMMU integration path.
+   - Hand-written CPU loops or non-cuBLAS GEMM: rewrite to `cublasDgemm` regardless of hardware.
 
 ---
 
@@ -178,13 +239,58 @@ The viability of the approach is no longer in question — NVIDIA shipped it. Th
 
 ## 8. Summary
 
-| Question                                           | Answer                                                                  |
-|----------------------------------------------------|-------------------------------------------------------------------------|
-| Is the Ozaki Scheme numerically sound?             | Yes — Error-Free Transformation. Bit-exact. Verified on H200.           |
-| Will FP64 keep declining on future GPUs?           | Likely yes on consumer / ML-class; HPC line uncertain (Rubin TBD).      |
-| Does cuBLAS now do Ozaki natively?                 | Yes, on Blackwell, in CUDA 13.0 Update 2 (Oct 2025).                    |
-| Do users still need to write Ozaki integration?    | Only for non-cuBLAS code, non-Blackwell GPUs, or precision-tuned cases. |
-| Does `try-ozaki` still have value?                 | Yes — for source-level modernization, profiling, and validation.        |
-| What should `try-ozaki` default to rewriting to?   | `cublasDgemm`. ozIMMU is now a fallback, not the primary target.        |
+| Question                                           | Answer                                                                          |
+|----------------------------------------------------|---------------------------------------------------------------------------------|
+| Is the Ozaki Scheme numerically sound?             | Yes — Error-Free Transformation. Bit-exact. Verified on H200.                   |
+| Will FP64 keep declining on future GPUs?           | Likely yes on consumer / ML-class; HPC line uncertain (Rubin TBD).              |
+| Does cuBLAS now do Ozaki natively?                 | Yes, in CUDA 13.0 Update 2 (Oct 2025).                                          |
+| On which GPUs does cuBLAS FP64 emulation work?     | Ampere (CC 8.x), Hopper (9.0), Blackwell (10.x, 11.0, 12.x). Includes A100/H100/H200. |
+| Can it be enabled without code changes?            | Yes — set `CUBLAS_EMULATE_DOUBLE_PRECISION=1` env var.                          |
+| Do users still need to write Ozaki integration?    | Only for non-cuBLAS code, pre-Ampere GPUs, or precision-tuned cases.            |
+| Does `try-ozaki` still have value?                 | Yes — for source-level modernization, profiling, and validation.                |
+| What should `try-ozaki` default to rewriting to?   | `cublasDgemm`. ozIMMU is now a fallback for pre-Ampere hardware only.           |
 
 The strategic position to communicate to researchers: **the Ozaki Scheme is no longer the question. The question is whether your code is in a form that can use it.** That is what this tool helps determine.
+
+---
+
+## 9. References
+
+### NVIDIA primary sources
+
+- **[cuBLAS Floating-Point Emulation — official documentation](https://docs.nvidia.com/cuda/cublas/#floating-point-emulation)** — authoritative API reference for `cublasSetMathMode`, `CUBLAS_FP64_EMULATED_FIXEDPOINT_MATH`, mantissa-control APIs, environment variables, supported compute capabilities, and known limitations.
+- **[Unlocking Tensor Core Performance with Floating-Point Emulation in cuBLAS](https://developer.nvidia.com/blog/unlocking-tensor-core-performance-with-floating-point-emulation-in-cublas/)** — NVIDIA developer blog post (October 2025) introducing FP64 emulation in CUDA 13.0 Update 2, with ecTrans / BerkeleyGW / Quantum ESPRESSO benchmark results and heat maps.
+- **[CUDA Toolkit 13.0 Update 2 download](https://developer.nvidia.com/cuda-downloads)** — required version for FP64 emulation features.
+- **[CUDA Library Samples — Emulation examples](https://github.com/NVIDIA/CUDALibrarySamples)** — runnable example code from NVIDIA showing how to invoke emulated GEMM.
+- **[CUDA GPU Compute Capability matrix](https://developer.nvidia.com/cuda-gpus)** — map specific GPU SKUs to their compute capabilities (to determine cuBLAS emulation eligibility).
+
+### Academic / theoretical foundations
+
+- **arXiv:2504.08009** — *[Ozaki Scheme II: A GEMM-oriented emulation of floating-point matrix multiplication using an integer modular technique](https://arxiv.org/abs/2504.08009)*. The CRT/modular variant; reduces total low-precision GEMM calls relative to Ozaki-I.
+- **arXiv:2508.00441** — *[DGEMM without FP64 Arithmetic — using FP64 Emulation and FP8 Tensor Cores with Ozaki Scheme](https://arxiv.org/abs/2508.00441)* ([HTML](https://arxiv.org/html/2508.00441v3) | [PDF](https://arxiv.org/pdf/2508.00441v3)). Parameterizes slice counts to map FP64 onto hardware lacking FP64 units. Reports 30–50× speedup on RTX 4090.
+- **[Analysis of Floating-Point Matrix Multiplication Computed via Integer Arithmetic](https://www.netlib.org/lapack/lawnspdf/lawn324.pdf)** (Netlib LAWN, Dongarra et al., 2025) — Exponent-Span-Capacity (ESC) metric for selecting the minimum slice count to guarantee target precision.
+- **[Performance enhancement of the Ozaki Scheme on integer matrix multiplication units](https://dl.acm.org/doi/epdf/10.1145/3784828.3785017)** (ACM, 2025) — describes the optimizations in `accelerator_for_ozIMMU`: error-free summation (`ozIMMU_EF`), improved splitting (`ozIMMU_RN`), combined variant (`ozIMMU_H`), and n-blocking.
+
+### Reference implementations
+
+- **[ozIMMU](https://github.com/enp1s0/ozIMMU)** (Mukunoki / enp1s0) — original CUDA/C++ INT8 Tensor Core Ozaki GEMM library. The reference implementation that `try-ozaki` currently links against on the GPU worker.
+- **[accelerator_for_ozIMMU](https://github.com/RIKEN-RCCS/accelerator_for_ozIMMU)** (RIKEN-RCCS) — patch library adding `_EF`, `_RN`, `_H` performance variants and n-blocking for large matrices.
+- **[cutf](https://github.com/enp1s0/cutf)** — CUDA Utility Functions, a header-only dependency of ozIMMU (note: lives at `enp1s0/cutf`, not `wmmae/cutf`).
+
+### Workshop & talk material
+
+- **[CERN/NVIDIA Openlab Workshop slides — Emulating Matrix Multiplication Using Mixed-Precision Computation (July 2025)](https://indico.cern.ch/event/1538409/contributions/6522024/attachments/3097817/5488258/OZAKI_slide_CERN.pdf)** — Ozaki, Uchino, Imamura. 25-slide deck covering Ozaki-I and Ozaki-II with GPU throughput benchmarks across RTX 4090, H200, B200, GB200.
+- **[Energy-Efficient Supercomputing Through Tensor Core-Accelerated Mixed-Precision Computing and Floating-Point Emulation](https://www.nvidia.com/en-us/on-demand/)** — NVIDIA on-demand video on the energy/perf case for FP emulation.
+- **[Precision Redefined: Unlocking and Delivering the Full Power of Modern GPUs for Scientific Computing](https://www.nvidia.com/en-us/on-demand/)** — NVIDIA conference talk slides on the broader FP emulation strategy.
+
+### Background reading
+
+- **[Emergent Mind — Ozaki Scheme II topic page](https://www.emergentmind.com/topics/ozaki-ii-scheme)** — aggregator of related papers, including *Guaranteed DGEMM Accuracy via Extensions of the Ozaki Scheme* and *Emulation of Complex Matrix Multiplication based on CRT*.
+- **[NVIDIA Hopper Architecture Whitepaper](https://resources.nvidia.com/en-us-tensor-core)** — H100/H200 Tensor Core specifications, FP64 throughput numbers used in Section 1.
+- **[NVIDIA Blackwell Architecture Whitepaper](https://resources.nvidia.com/en-us-blackwell-architecture)** — B200/GB200 specifications, FP4 / INT8 throughput.
+
+### Project-internal documents
+
+- [`README.md`](./README.md) — current implementation status, run results, what worked / what failed.
+- [`CLAUDE.md`](./CLAUDE.md) — architecture, pipeline stages, S3 datasource setup, Run:ai cluster details.
+- [`examples/ozaki-simple/`](./examples/ozaki-simple/) — minimal Fortran DGEMM benchmark used for end-to-end validation; covers both the cuBLAS native baseline and the ozIMMU rewrite.

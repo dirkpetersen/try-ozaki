@@ -50,11 +50,18 @@ log "apt done: cmake=$(cmake --version 2>/dev/null | head -1), gfortran=$(gfortr
 # ── Clone and build ozIMMU ─────────────────────────────────────────────────
 # ozIMMU requires CUDA dev headers; build is best-effort
 if [ ! -f "/usr/local/lib/libozIMMU.so" ] && [ ! -f "/usr/local/lib/libozIMMU.a" ]; then
-    log "Cloning ozIMMU and its dependencies..."
-    git clone --depth=1 @OZIMMU_REPO@ "$OZIMMU_DIR" >> "$LOGFILE" 2>&1 || { log "WARNING: ozIMMU clone failed."; }
-    # cutf is a header-only dependency; ozIMMU CMakeLists looks for it at src/cutf/include
-    git clone --depth=1 https://github.com/wmmae/cutf "$OZIMMU_DIR/src/cutf" >> "$LOGFILE" 2>&1 \
-        || { log "WARNING: cutf clone failed."; }
+    log "Unpacking pre-bundled ozIMMU + cutf from mount..."
+    # ozIMMU sources are bundled by the app host and uploaded to S3 alongside src.tar.gz
+    # to avoid needing outbound internet access from the GPU worker container.
+    if [ -f "$MOUNT_JOB_DIR/ozimmu.tar.gz" ]; then
+        tar -xzf "$MOUNT_JOB_DIR/ozimmu.tar.gz" -C "$(dirname $OZIMMU_DIR)"
+        log "ozIMMU unpacked from bundle."
+    else
+        log "WARNING: ozimmu.tar.gz not found in mount, trying git clone (may fail without internet)..."
+        git clone --depth=1 @OZIMMU_REPO@ "$OZIMMU_DIR" >> "$LOGFILE" 2>&1 || { log "WARNING: ozIMMU clone failed."; }
+        git clone --depth=1 https://github.com/enp1s0/cutf "$OZIMMU_DIR/src/cutf" >> "$LOGFILE" 2>&1 \
+            || { log "WARNING: cutf clone failed."; }
+    fi
     if [ -d "$OZIMMU_DIR" ]; then
         log "Building ozIMMU..."
         cmake -S "$OZIMMU_DIR" -B "$OZIMMU_DIR/build" \\

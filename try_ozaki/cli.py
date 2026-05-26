@@ -27,10 +27,40 @@ from .submitter import delete_job, stream_logs, submit_job, wait_for_job
 
 
 def _pack_sources(original_dir: Path, ozaki_dir: Path, dest: Path) -> None:
-    """Pack original/ and ozaki/ into a single src.tar.gz."""
     with tarfile.open(dest, "w:gz") as tar:
         tar.add(original_dir, arcname="src/original")
         tar.add(ozaki_dir, arcname="src/ozaki")
+
+
+def _pack_ozimmu(ozimmu_local: Path, dest: Path) -> bool:
+    """Pack the locally cloned ozIMMU+cutf tree into ozimmu.tar.gz.
+    Returns True if the archive was created, False if the source dir is missing.
+    """
+    if not ozimmu_local.is_dir():
+        return False
+    with tarfile.open(dest, "w:gz") as tar:
+        tar.add(ozimmu_local, arcname="ozIMMU")
+    return True
+
+
+def _ensure_ozimmu_local(cache_dir: Path) -> Path:
+    """Return a local clone of ozIMMU+cutf, fetching via gh CLI if not cached."""
+    ozimmu_dir = cache_dir / "ozIMMU"
+    if (ozimmu_dir / "CMakeLists.txt").exists():
+        return ozimmu_dir
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    print("[try-ozaki] Cloning ozIMMU + cutf (one-time, cached)...", flush=True)
+    import subprocess
+    subprocess.run(
+        ["gh", "repo", "clone", "enp1s0/ozIMMU", str(ozimmu_dir), "--", "--depth=1"],
+        check=True, capture_output=True,
+    )
+    subprocess.run(
+        ["gh", "repo", "clone", "enp1s0/cutf", str(ozimmu_dir / "src" / "cutf"), "--", "--depth=1"],
+        check=True, capture_output=True,
+    )
+    return ozimmu_dir
 
 
 def _upload_s3(local_path: Path, bucket: str, key: str, region: str = "us-east-1") -> None:
@@ -109,6 +139,16 @@ def run(
     _pack_sources(orig_dir, ozaki_dir, archive)
     job_s3_prefix = f"{s3_prefix}/{job_id}"
     _upload_s3(archive, s3_bucket, f"{job_s3_prefix}/src.tar.gz", region=s3_region)
+
+    # Bundle ozIMMU + cutf so the worker doesn't need internet access
+    ozimmu_cache = Path.home() / ".cache" / "try-ozaki" / "ozIMMU"
+    try:
+        ozimmu_local = _ensure_ozimmu_local(ozimmu_cache.parent)
+        ozimmu_archive = work_dir / "ozimmu.tar.gz"
+        if _pack_ozimmu(ozimmu_local, ozimmu_archive):
+            _upload_s3(ozimmu_archive, s3_bucket, f"{job_s3_prefix}/ozimmu.tar.gz", region=s3_region)
+    except Exception as e:
+        print(f"[try-ozaki] Warning: could not bundle ozIMMU ({e}); worker will attempt git clone.", flush=True)
 
     # ── 5. Generate & upload job script ──────────────────────────────────────
     script_content = gen_script(

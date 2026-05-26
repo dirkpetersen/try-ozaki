@@ -1,5 +1,11 @@
 # Discussion: The Ozaki Scheme, Declining GPU FP64, and What `try-ozaki` Should Be
 
+**Key external references for this document:**
+
+- [NVIDIA CUDA Library Samples (GitHub)](https://github.com/nvidia/cudalibrarysamples) — runnable example code, including FP emulation samples
+- [cuBLAS Documentation](https://docs.nvidia.com/cuda/cublas) — authoritative API reference, including the [Floating-Point Emulation section](https://docs.nvidia.com/cuda/cublas/#floating-point-emulation)
+- [CUDA C++ Programming Guide](https://docs.nvidia.com/cuda/cuda-programming-guide/) — compute capabilities, Tensor Core programming model, memory hierarchy
+
 This document captures the strategic rationale for `try-ozaki` and reassesses the project in light of NVIDIA's [CUDA Toolkit 13.0 Update 2](https://developer.nvidia.com/blog/unlocking-tensor-core-performance-with-floating-point-emulation-in-cublas/) (October 2025), which integrates the Ozaki Scheme directly into cuBLAS.
 
 ---

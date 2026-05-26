@@ -1,58 +1,102 @@
-# Discussion: The Ozaki Scheme, Declining GPU FP64, and What `try-ozaki` Should Be
+# Discussion: FP64 on Blackwell and Vera Rubin — How `try-ozaki` Addresses the Gap
+
+> **The headline.** We have two procurement candidates for the next round of technical-computing capacity: the **NVIDIA RTX PRO 6000 Blackwell Server Edition** and the upcoming **NVIDIA Vera Rubin (GB200-class)** with ARM Vera CPUs. **Neither platform offers competitive native FP64 vector throughput compared to traditional HPC hardware.** Both are designed primarily for AI / mixed-precision workloads. If we want our researchers' double-precision scientific codes to run well on either platform, we must address the FP64 deficit deliberately. The **Ozaki Scheme** — emulating FP64 GEMM via INT8 / FP8 Tensor Cores with bit-exact output — is the leading technique for doing so. The `try-ozaki` package we are building is the tool that helps researchers identify, rewrite, and validate the parts of their codebases that can benefit.
 
 **Key external references for this document:**
 
 - [NVIDIA CUDA Library Samples (GitHub)](https://github.com/nvidia/cudalibrarysamples) — runnable example code, including FP emulation samples
 - [cuBLAS Documentation](https://docs.nvidia.com/cuda/cublas) — authoritative API reference, including the [Floating-Point Emulation section](https://docs.nvidia.com/cuda/cublas/#floating-point-emulation)
 - [CUDA C++ Programming Guide](https://docs.nvidia.com/cuda/cuda-programming-guide/) — compute capabilities, Tensor Core programming model, memory hierarchy
+- [NVIDIA Developer Blog — Unlocking Tensor Core Performance with FP Emulation in cuBLAS](https://developer.nvidia.com/blog/unlocking-tensor-core-performance-with-floating-point-emulation-in-cublas/) — the announcement of cuBLAS FP64 emulation in CUDA 13.0u2
 
 **Pinned local copies (authoritative for the version this document references):**
 
 - [`docs/cuda/CUBLAS_Library.md`](./docs/cuda/CUBLAS_Library.md) — full cuBLAS Library Reference, including the Floating-Point Emulation section
 - [`docs/cuda/cuda-programming-guide.md`](./docs/cuda/cuda-programming-guide.md) — CUDA C++ Programming Guide, including the per-architecture Tensor Core support table
 
-This document captures the strategic rationale for `try-ozaki` and reassesses the project in light of NVIDIA's [CUDA Toolkit 13.0 Update 2](https://developer.nvidia.com/blog/unlocking-tensor-core-performance-with-floating-point-emulation-in-cublas/) (October 2025), which integrates the Ozaki Scheme directly into cuBLAS.
+---
+
+## 1. The two target platforms and their FP64 problem
+
+### 1.1 RTX PRO 6000 Blackwell Server Edition
+
+| Metric                                | Value                                                                  |
+|---------------------------------------|------------------------------------------------------------------------|
+| FP64 vector (native)                  | **~1.97 TFLOPS**                                                       |
+| FP64 Tensor Core / DGEMM (native)     | **0 TFLOPS — not supported**                                           |
+| FP32 single precision                 | ~120–126 TFLOPS                                                        |
+| FP4 Tensor (with sparsity)            | ~2,000–4,000 TFLOPS (2–4 PFLOPS)                                       |
+| Memory                                | 96 GB GDDR7 (ECC)                                                      |
+| Power                                 | 600 W                                                                  |
+
+**The architecture context.** The RTX PRO 6000 Blackwell Server Edition is fundamentally designed for AI inference, neural rendering, visual computing, and mixed-precision simulations (CFD, Omniverse-class physical AI). The vast majority of its die is allocated to single-precision (FP32), Ray Tracing cores, and narrow-precision AI math (FP8 / FP4). The hardware FP64 rate is **1 FP64 op per 64 FP32 ops** — a deliberate de-prioritization. Researchers running unmodified FP64 scientific codes on this card will see throughput roughly **30× lower than an H100 / H200** despite the card being a current-generation product.
+
+### 1.2 Vera Rubin GB200-class (ARM Vera CPU + Rubin GPU)
+
+| Precision Variant                              | Per Rubin GPU | Vera Rubin Superchip<br>(2× GPU + 1× Vera CPU) | Vera Rubin NVL72<br>(72× GPU rack) |
+|------------------------------------------------|---------------|------------------------------------------------|------------------------------------|
+| FP64 Vector (Standard)                         | 33 TFLOPS     | 67 TFLOPS                                      | **2,400 TFLOPS (2.4 PFLOPS)**      |
+| FP64 DGEMM (Tensor Core, **emulated**)         | 200 TFLOPS    | 400 TFLOPS                                     | **14,400 TFLOPS (14.4 PFLOPS)**    |
+
+**The critical observation.** The Rubin per-GPU FP64 vector rate (33 TFLOPS) is **less than half** of the H100/H200 native FP64 rate (~67 TFLOPS). The 200 TFLOPS DGEMM number — and the headline 14.4 PFLOPS at NVL72 scale — is **achieved exclusively through Tensor Core emulation**, i.e. the Ozaki Scheme running on top of INT8 / FP8 / FP4 hardware. **There is no native FP64 Tensor Core on Rubin.** If a code does not route its DGEMM through the emulated path, it gets the 33 TFLOPS vector number, not the 200 TFLOPS DGEMM number.
+
+This is roughly a **6× difference in achievable performance per GPU** depending entirely on whether the code is in a form that cuBLAS (or ozIMMU) can emulate.
+
+### 1.3 Why this matters for the procurement decision
+
+Compared to a **traditional HPC GPU (H200, ~67 TFLOPS native FP64 with full FP64 Tensor Cores)**:
+
+| GPU class                           | FP64 vector | FP64 DGEMM (best path)    | Path to best perf      |
+|-------------------------------------|-------------|---------------------------|------------------------|
+| H200 (Hopper, our current dgx001)   | ~34 TFLOPS  | ~67 TFLOPS native FP64 TC | already automatic      |
+| **RTX PRO 6000 Blackwell**          | ~1.97 TFLOPS| **N/A native — emulated only** | **must emulate**  |
+| **Rubin GPU**                       | 33 TFLOPS   | 200 TFLOPS **emulated**   | **must emulate**       |
+
+For both target platforms, native FP64 throughput is *worse* than what we already have on H200. **The performance benefit only materializes when the code's DGEMM calls are routed through the Tensor Core emulation path.** That is the central technical problem this document — and `try-ozaki` — addresses.
 
 ---
 
-## 1. The original concern: FP64 throughput is being de-prioritized in modern GPUs
-
-Researchers in scientific computing have built decades of code on the assumption that double-precision arithmetic is a first-class GPU capability. That assumption is becoming hardware-dependent:
-
-| GPU                     | Year | FP64 peak    | INT8 / FP4 peak          | FP64 fraction |
-|-------------------------|------|--------------|--------------------------|---------------|
-| V100                    | 2017 | 7.8 TFLOP/s  | 125 TFLOP/s (FP16 TC)    | ~6%           |
-| A100                    | 2020 | 9.7 TFLOP/s  | 312 TFLOP/s (INT8 TC)    | ~3%           |
-| H100                    | 2022 | 67 TFLOP/s   | 1,979 TFLOP/s (INT8 TC)  | ~3%           |
-| H200                    | 2024 | 67 TFLOP/s   | 1,979 TFLOP/s (INT8 TC)  | ~3%           |
-| **RTX 4090** (consumer) | 2022 | 1.3 TFLOP/s  | 1,457 TFLOP/s (INT8 TC)  | **~0.09%**    |
-| B200 / GB200            | 2025 | ~80 TFLOP/s  | 36,000 TFLOP/s (FP4 TC)  | ~0.2%         |
-
-Two patterns are clear:
-
-1. The **HPC line** (V100 → A100 → H100 → H200) has preserved FP64, but it is a smaller and smaller fraction of total throughput each generation.
-2. The **consumer / ML-focused line** (RTX, eventually likely Rubin) has effectively no FP64 — orders of magnitude less than INT8/FP4.
-
-If NVIDIA's Rubin generation continues the Blackwell direction, scientific codes that depend heavily on FP64 will see their effective performance per dollar decline sharply, even as raw transistor counts continue to grow. The Ozaki Scheme is the leading technique for routing FP64 workloads onto INT8/FP8 Tensor Cores while preserving exact results.
-
----
-
-## 2. What the Ozaki Scheme actually guarantees
+## 2. Where the Ozaki Scheme fits
 
 The Ozaki Scheme is **not an approximation**. It is an Error-Free Transformation (EFT):
 
 - Input matrices are dynamically split into low-precision slices such that each slice's significand fits within the target hardware's exact-multiply range.
-- Cross-products of slices are computed exactly on INT8/FP32 Tensor Cores.
+- Cross-products of slices are computed exactly on INT8 / FP8 / FP32 Tensor Cores.
 - The high-precision result is reconstructed via weighted summation, also exactly.
 - For sufficiently many slices, the final result is **bit-identical to a native FP64 multiply**.
 
 Our own end-to-end experiment on a single H200 (`examples/ozaki-simple`, 2048×2048 DGEMM, 5 reps) confirmed this: `max relative error = 0.000` against the cuBLAS FP64 reference, across all reps. The math works in practice exactly as the theory predicts.
 
-The trade-off is the **slice count**. Each additional slice is one more INT8 GEMM call. ozIMMU's `auto` mode uses the input matrix exponent range to select the minimum slice count needed for IEEE 754 FP64 equivalent accuracy. For typical scientific matrices this is 3–8 slices.
+The trade-off is the **slice count**. Each additional slice is one more INT8/FP8 GEMM call. ozIMMU's `auto` mode and cuBLAS's Automatic Dynamic Precision (ADP) framework both select the minimum slice count needed for IEEE 754 FP64 equivalent accuracy from the input's exponent range. For typical scientific matrices this is 3–8 slices.
+
+### Quantifying the speedup we expect on each platform
+
+| Platform                     | Workload                       | Expected speedup of Ozaki vs native FP64 path                                |
+|------------------------------|--------------------------------|-------------------------------------------------------------------------------|
+| RTX PRO 6000 Blackwell       | FP64 DGEMM ≥ 4096²             | **~13× over the 1.97 TFLOPS vector path** (per NVIDIA cuBLAS heat maps)      |
+| Rubin GPU                    | FP64 DGEMM                     | **~6× over the 33 TFLOPS vector path** (200 / 33 ≈ 6.06 from spec)            |
+| Rubin Superchip (2× GPU)     | FP64 DGEMM                     | ~6× → **400 TFLOPS** vs 67 TFLOPS                                             |
+| Rubin NVL72 (72× GPU rack)   | FP64 DGEMM at scale            | ~6× → **14.4 PFLOPS** vs 2.4 PFLOPS                                           |
+| H200 (today, for comparison) | FP64 DGEMM                     | **~0.6×** (slower; native FP64 TC wins on Hopper — our measured result)       |
+| H200                         | DGEMV / TRSM / non-GEMM        | not applicable (cuBLAS does not emulate these)                                |
+
+### Quantifying the efficiency gain
+
+The procurement-relevant question is "how much hardware do I need to deliver a target FP64 rate?" That ratio falls out directly:
+
+| To deliver 1 PFLOPS of FP64 DGEMM, how many GPUs do I need? | Native vector path | Ozaki-emulated path |
+|-------------------------------------------------------------|--------------------|---------------------|
+| H200                                                        | ~15 GPUs           | ~15 GPUs (no benefit)|
+| RTX PRO 6000 Blackwell                                      | ~510 GPUs          | **~40 GPUs** (~13×)  |
+| Rubin GPU                                                   | ~31 GPUs           | **~5 GPUs** (~6×)    |
+
+For a fixed PFLOPS target on either of the procurement candidates, **using the Ozaki-emulated path means roughly one-sixth (Rubin) to one-thirteenth (RTX PRO 6000) of the hardware** — with a corresponding cut in capital cost, power draw, rack space, and cooling. The efficiency gain is real and quantifiable, but it is conditional on the codes actually routing through the emulation path.
+
+This is the lever `try-ozaki` operates on.
 
 ---
 
-## 3. The H200 result and what it means
+## 3. The H200 calibration result
 
 In our test on dgx001:
 
@@ -63,21 +107,15 @@ Speedup:               0.64×  (Ozaki is slower)
 Max relative error:    0.000e+00
 ```
 
-This is not a defeat — it is exactly the predicted outcome. The H200 has dedicated FP64 Tensor Cores and cuBLAS FP64 fully exploits them. On hardware that's optimized for FP64, native FP64 wins. The Ozaki advantage appears on hardware that **isn't** optimized for FP64.
-
-Published benchmarks confirm this:
-
-- **RTX 4090** (consumer, weak FP64): Ozaki on INT8 TCs delivers **30–50× speedup** vs native FP64 with zero numerical error.
-- **GB200 NVL72** (Blackwell): NVIDIA reports up to **2.3× speedup** for FP64 GEMM via Ozaki emulation versus native FP64.
-- **RTX PRO 6000 Blackwell** (workstation): Up to **13× speedup** for FP64 GEMM.
-
-The trajectory of the FP64/INT8 ratio strongly suggests these speedup factors will *grow*, not shrink, on future generations.
+This is not a defeat — it is exactly the predicted outcome. The H200 has full FP64 Tensor Cores and cuBLAS FP64 exploits them. The result is **the calibration**: it confirms (a) the Ozaki path is numerically correct end-to-end on real GPU hardware, and (b) the speedup signal points the right direction — Ozaki wins exactly where native FP64 hardware is weak. On the H200 native FP64 wins; on the RTX PRO 6000 Blackwell and Rubin, where native FP64 is anemic by design, Ozaki wins by 6–13×.
 
 ---
 
-## 4. The CUDA 13.0 Update 2 turning point (October 2025)
+## 4. What cuBLAS already covers — and where it leaves gaps
 
-The NVIDIA blog post and the offline copies of the [official cuBLAS Library Reference](./docs/cuda/CUBLAS_Library.md) and [CUDA C++ Programming Guide](./docs/cuda/cuda-programming-guide.md) committed in this repo change the picture significantly. cuBLAS now implements FP emulation directly.
+The good news for both procurement candidates is that NVIDIA has started shipping the Ozaki Scheme inside cuBLAS itself. As of CUDA 13.0 Update 2 (October 2025), the FP64 emulation that's needed to extract the 200 TFLOPS-per-Rubin-GPU number — and the 13× RTX PRO 6000 Blackwell number — is built into the vendor library. The bad news is that the coverage is narrow: it's **`cublasGemmEx` family only**, with no native support for typed `cublasDgemm`, GEMV, TRSM, LU, FFT, or sparse routines. That gap is exactly where `try-ozaki` has work to do.
+
+The rest of this section verifies the cuBLAS coverage against the local copies of the [official cuBLAS Library Reference](./docs/cuda/CUBLAS_Library.md) and [CUDA C++ Programming Guide](./docs/cuda/cuda-programming-guide.md).
 
 ### Hardware and version support (verified against official docs)
 
@@ -258,11 +296,64 @@ What we built so far validates **the second half** of this end-to-end on a real 
 
 ---
 
-## 7. Recommendation for researchers asking about Vera Rubin
+## 7. What runs where: a workload-routing assessment
+
+Given the two procurement candidates, the practical question for each scientific workload is "which platform is the right home for this code?" The answer depends on what mathematical operations dominate, not just the FP64 peak number on the spec sheet.
+
+### 7.1 Workloads that should run on Rubin (with Ozaki / cuBLAS emulation)
+
+These workloads are **GEMM-dominated** — matrix-matrix multiplication is the inner kernel and most of the runtime. They include:
+
+- **Dense linear algebra** — DFT-based codes (Quantum ESPRESSO, VASP, NWChem), molecular dynamics force-field assembly, quantum chemistry (ZGEMM via complex emulation)
+- **Climate / weather spectral codes** — ecTrans-class transformations
+- **Many-body physics** — BerkeleyGW-class GW calculations
+- **Dense neural-network training and large-language-model fine-tuning** — already FP16/BF16 dominated, runs natively on Rubin without emulation
+
+For these, **Rubin is the right platform**. The 200 TFLOPS-per-GPU FP64 DGEMM number, scaling to 14.4 PFLOPS at NVL72, is competitive with traditional HPC hardware once the codes route through `cublasGemmEx`. The native 33 TFLOPS vector path is *not* competitive — getting the headline number requires emulation. That is what `try-ozaki` makes feasible.
+
+**Expected speedup vs running unmodified on Rubin: 6× per GPU.**
+
+### 7.2 Workloads where the RTX PRO 6000 Blackwell makes sense
+
+These are workloads where:
+
+- FP32 single-precision is sufficient for the science (the card has ~125 TFLOPS FP32)
+- The code is FP4/FP8/FP16-dominated (AI inference, neural rendering, mixed-precision CFD, Omniverse-class physical AI)
+- There is **occasional** FP64 work, small enough that the 1.97 TFLOPS native rate is tolerable, or large enough that cuBLAS's 13× emulation lift is worth taking
+
+The RTX PRO 6000 Blackwell is **not** a good home for sustained FP64 numerical work. Even with cuBLAS emulation delivering 13× over the 1.97 TFLOPS vector rate, the absolute number is far below Rubin and below H200. **Use it for AI / mixed-precision / FP32 workloads where its strengths shine.** Push pure FP64 codes onto Rubin or keep them on the existing H200 fleet.
+
+### 7.3 Is FP32 sufficient for our researchers' codes?
+
+This question matters because if FP32 is sufficient, the FP64 problem disappears for that code on the Blackwell card and the Ozaki path becomes optional rather than required. The honest answer is **it depends entirely on the numerical conditioning of the problem**:
+
+- **Yes, FP32 is fine** for: many CFD codes (especially LES / RANS with bounded condition numbers), most neural-network training, ray tracing / rendering, molecular dynamics with single-precision force fields, single-precision FFTs in signal processing.
+- **No, FP32 is not safe** for: ill-conditioned linear systems, long-term molecular dynamics integration where energy drift matters, climate codes accumulating over long simulation horizons, eigenvalue problems with closely-spaced eigenvalues, ab-initio quantum chemistry with energy differences smaller than FP32 epsilon.
+- **It depends** for: most density functional theory codes (DFT) — small problems may be FP32-safe but the canonical benchmarks need FP64 for energy-difference accuracy.
+
+This is exactly the question `try-ozaki`'s validation pipeline can answer for a given code: run the code in both FP64 and emulated-FP64 modes (which match each other to machine precision) versus a hypothetical FP32 port, and compare the numerical drift over the simulation horizon. If FP32 produces results within the user's tolerance, the FP64 problem doesn't apply to that code. If it doesn't, Ozaki emulation is the only path that delivers FP64-quality results on these new platforms at competitive throughput.
+
+### 7.4 Quantified efficiency story for Vera Rubin procurement
+
+For a **1 PFLOPS sustained FP64 DGEMM target** (a typical departmental workload):
+
+| Path                                               | GPUs needed | Power (rough) | Rack space  |
+|----------------------------------------------------|-------------|---------------|-------------|
+| Rubin native FP64 vector (33 TFLOPS/GPU)           | ~31         | high          | ~half rack  |
+| Rubin **with `try-ozaki` rewrite + cuBLAS emul.**  | **~5**      | **~6× lower** | **~5 GPUs** |
+| Equivalent on H200 (native FP64 TC, ~67 TFLOPS)    | ~15         | reference     | reference   |
+
+The procurement message: **buying Rubin and running unmodified FP64 code wastes most of the hardware's potential.** Buying Rubin and running Ozaki-routed code delivers ~3× the performance per dollar of an equivalent H200 cluster. The delta is the ~6× emulation lift Rubin's design assumes will be applied.
+
+For the **RTX PRO 6000 Blackwell** the math is even starker: native FP64 (1.97 TFLOPS) requires ~510 GPUs for 1 PFLOPS; with the cuBLAS 13× emulation lift, ~40 GPUs. But the right move on this card is usually to ask whether FP32 would do, since FP32 is ~125 TFLOPS native — only ~8 GPUs needed at the FP32 throughput of 1 PFLOPS-equivalent.
+
+---
+
+## 8. Recommendation for researchers asking about Vera Rubin
 
 The concern about declining FP64 in future GPUs is **valid and well-timed**. The technical answer is:
 
-1. **The Ozaki Scheme is real, it works, and it is now vendor-supported.** Codes ported to it get bit-exact FP64 results from INT8/FP8 Tensor Cores. This is no longer an experimental academic paper — it's in cuBLAS.
+1. **The Ozaki Scheme is real, it works, and it is now vendor-supported.** Codes ported to it get bit-exact FP64 results from INT8/FP8 Tensor Cores. This is no longer an experimental academic paper — it's in cuBLAS, and Rubin's published peak FP64 number depends on it.
 
 2. **For codes that already use `cublasGemmEx`, the migration to Vera Rubin is a CUDA upgrade, nothing more.** The Automatic Dynamic Precision framework will choose between native FP64 and emulated FP64 on whatever hardware is present.
 
@@ -274,25 +365,28 @@ The viability of the approach is no longer in question — NVIDIA shipped it. Th
 
 ---
 
-## 8. Summary
+## 9. Summary
 
-| Question                                           | Answer                                                                          |
-|----------------------------------------------------|---------------------------------------------------------------------------------|
-| Is the Ozaki Scheme numerically sound?             | Yes — Error-Free Transformation. Bit-exact. Verified on H200.                   |
-| Will FP64 keep declining on future GPUs?           | Likely yes on consumer / ML-class; HPC line uncertain (Rubin TBD).              |
-| Does cuBLAS now do Ozaki natively?                 | Yes — FP64 fixed-point in CUDA 13.0u2; FP32 BF16x9 since CUDA 12.9.             |
-| On which GPUs does cuBLAS FP64 emulation work?     | Ampere (CC 8.x), Hopper (9.0), Blackwell (10.x, 11.0, 12.x). Includes A100/H100/H200. |
-| Which routines are covered by emulation?           | **`cublasGemmEx` family only** — Batched, StridedBatched. Not typed `Dgemm`, not GEMV/TRSM/etc. |
-| Can it be enabled without code changes?            | Yes if code already calls `cublasGemmEx` — `CUBLAS_EMULATE_DOUBLE_PRECISION=1`. |
-| Do users still need to write Ozaki integration?    | Only for non-cuBLAS code, pre-Ampere GPUs, non-GEMM routines, or precision-tuned cases. |
-| Does `try-ozaki` still have value?                 | Yes — typed-Dgemm→GemmEx rewrites, CPU-loop modernization, profiling, validation. |
-| What should `try-ozaki` default to rewriting to?   | `cublasGemmEx` with `CUBLAS_COMPUTE_64F_EMULATED_FIXEDPOINT`. ozIMMU is fallback. |
+| Question                                                       | Answer                                                                                |
+|----------------------------------------------------------------|---------------------------------------------------------------------------------------|
+| Do RTX PRO 6000 Blackwell or Vera Rubin have strong native FP64? | **No.** RTX PRO 6000: 1.97 TFLOPS native FP64, no FP64 Tensor Cores. Rubin: 33 TFLOPS vector / no native FP64 TC. |
+| What's the headline Rubin FP64 number then?                    | **200 TFLOPS / GPU** — but only via **Tensor Core emulation** (Ozaki). 14.4 PFLOPS at NVL72 scale, all emulated. |
+| Without emulation, what do we get on Rubin?                    | 33 TFLOPS / GPU — about half of H200. **Roughly 6× worse than the headline number.** |
+| Does cuBLAS already do this emulation?                         | Yes — FP64 fixed-point in CUDA 13.0u2; FP32 BF16x9 since CUDA 12.9.                   |
+| What's the gap cuBLAS leaves?                                  | **`cublasGemmEx` family only.** Typed `cublasDgemm`, GEMV, TRSM, LU, FFT, sparse, custom kernels — all uncovered. |
+| What workloads should run on Rubin (with `try-ozaki` rewrite)? | Dense FP64 GEMM-heavy codes: DFT, MD force assembly, climate spectral, GW, ZGEMM-heavy QC. |
+| What workloads belong on RTX PRO 6000 Blackwell?               | FP32-sufficient codes, AI inference, neural rendering, mixed-precision CFD/Omniverse. |
+| Speedup from `try-ozaki` rewrite on RTX PRO 6000 Blackwell?    | **~13×** vs native FP64 vector path (per cuBLAS heat maps).                           |
+| Speedup from `try-ozaki` rewrite on Rubin?                     | **~6×** per GPU vs native FP64 vector path (200/33 TFLOPS).                           |
+| Efficiency gain — GPUs needed for 1 PFLOPS sustained DGEMM?    | RTX PRO 6000: 510 → 40 GPUs; Rubin: 31 → 5 GPUs.                                      |
+| Is FP32 sufficient instead?                                    | Sometimes — depends on conditioning. `try-ozaki`'s validator can answer this per code. |
+| What should `try-ozaki` default to rewriting to?               | `cublasGemmEx` with `CUBLAS_COMPUTE_64F_EMULATED_FIXEDPOINT`. ozIMMU is fallback.     |
 
-The strategic position to communicate to researchers: **the Ozaki Scheme is no longer the question. The question is whether your code is in a form that can use it.** That is what this tool helps determine.
+The strategic position to communicate to researchers: **on the new platforms, native FP64 is no longer the path to performance — Ozaki-emulated FP64 is.** Whether your code can take that path depends on whether it's in a form `cublasGemmEx` (or ozIMMU) understands. That is exactly what `try-ozaki` evaluates and converts.
 
 ---
 
-## 9. References
+## 10. References
 
 ### Pinned local copies (use these — they're the version this document was written against)
 

@@ -47,38 +47,61 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y \\
     >> "$LOGFILE" 2>&1
 log "apt done: cmake=$(cmake --version 2>/dev/null | head -1), gfortran=$(gfortran --version 2>/dev/null | head -1)"
 
-# ── Clone and build ozIMMU ─────────────────────────────────────────────────
-# ozIMMU requires CUDA dev headers; build is best-effort
-if [ ! -f "/usr/local/lib/libozIMMU.so" ] && [ ! -f "/usr/local/lib/libozIMMU.a" ]; then
-    log "Unpacking pre-bundled ozIMMU + cutf from mount..."
-    # ozIMMU sources are bundled by the app host and uploaded to S3 alongside src.tar.gz
-    # to avoid needing outbound internet access from the GPU worker container.
-    if [ -f "$MOUNT_JOB_DIR/ozimmu.tar.gz" ]; then
-        tar -xzf "$MOUNT_JOB_DIR/ozimmu.tar.gz" -C "$(dirname $OZIMMU_DIR)"
-        log "ozIMMU unpacked from bundle."
+# ── Detect CUDA toolkit version ────────────────────────────────────────────
+# CUDA >= 13.2 has native cuBLAS FP64 emulation (Ozaki Scheme baked in).
+# CUDA <  13.2 requires the explicit ozIMMU library.
+NVCC_VERSION_RAW=$(nvcc --version 2>/dev/null | grep -oE 'release [0-9]+\\.[0-9]+' | awk '{print $2}')
+if [ -z "$NVCC_VERSION_RAW" ]; then
+    NVCC_VERSION_RAW="0.0"
+fi
+CUDA_MAJOR=$(echo "$NVCC_VERSION_RAW" | cut -d. -f1)
+CUDA_MINOR=$(echo "$NVCC_VERSION_RAW" | cut -d. -f2)
+log "Detected CUDA toolkit: ${NVCC_VERSION_RAW} (major=${CUDA_MAJOR}, minor=${CUDA_MINOR})"
+
+# Threshold: CUDA >= 13.2  →  use cuBLAS native emulation (no ozIMMU build)
+USE_CUBLAS_EMULATION=0
+if [ "$CUDA_MAJOR" -gt 13 ] || { [ "$CUDA_MAJOR" -eq 13 ] && [ "$CUDA_MINOR" -ge 2 ]; }; then
+    USE_CUBLAS_EMULATION=1
+    log "CUDA >= 13.2 detected → using cuBLAS native FP64 emulation backend (skipping ozIMMU build)"
+else
+    log "CUDA <  13.2 → falling back to ozIMMU library backend"
+fi
+
+# ── Clone and build ozIMMU (only when CUDA < 13.2) ─────────────────────────
+if [ "$USE_CUBLAS_EMULATION" -eq 0 ]; then
+    if [ ! -f "/usr/local/lib/libozIMMU.so" ] && [ ! -f "/usr/local/lib/libozIMMU.a" ]; then
+        log "Unpacking pre-bundled ozIMMU + cutf from mount..."
+        # ozIMMU sources are bundled by the app host and uploaded to S3 alongside src.tar.gz
+        # to avoid needing outbound internet access from the GPU worker container.
+        if [ -f "$MOUNT_JOB_DIR/ozimmu.tar.gz" ]; then
+            tar -xzf "$MOUNT_JOB_DIR/ozimmu.tar.gz" -C "$(dirname $OZIMMU_DIR)"
+            log "ozIMMU unpacked from bundle."
+        else
+            log "WARNING: ozimmu.tar.gz not found in mount, trying git clone (may fail without internet)..."
+            git clone --depth=1 @OZIMMU_REPO@ "$OZIMMU_DIR" >> "$LOGFILE" 2>&1 || { log "WARNING: ozIMMU clone failed."; }
+            git clone --depth=1 https://github.com/enp1s0/cutf "$OZIMMU_DIR/src/cutf" >> "$LOGFILE" 2>&1 \
+                || { log "WARNING: cutf clone failed."; }
+        fi
+        if [ -d "$OZIMMU_DIR" ]; then
+            log "Building ozIMMU..."
+            cmake -S "$OZIMMU_DIR" -B "$OZIMMU_DIR/build" \\
+                -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local \\
+                -DAUTO_SUBMODULE_UPDATE=OFF \\
+                -DBUILD_TEST=OFF \\
+                >> "$LOGFILE" 2>&1 \\
+                && cmake --build "$OZIMMU_DIR/build" -j$(nproc) >> "$LOGFILE" 2>&1 \\
+                && cmake --install "$OZIMMU_DIR/build" >> "$LOGFILE" 2>&1 \\
+                && echo '/usr/local/cuda/lib64' > /etc/ld.so.conf.d/cuda-ozaki.conf \\
+                && echo '/usr/local/lib' >> /etc/ld.so.conf.d/cuda-ozaki.conf \\
+                && ldconfig >> "$LOGFILE" 2>&1 \\
+                && log "ozIMMU installed and ldconfig updated." \\
+                || log "WARNING: ozIMMU build failed (Ozaki binary will not be available)."
+        fi
     else
-        log "WARNING: ozimmu.tar.gz not found in mount, trying git clone (may fail without internet)..."
-        git clone --depth=1 @OZIMMU_REPO@ "$OZIMMU_DIR" >> "$LOGFILE" 2>&1 || { log "WARNING: ozIMMU clone failed."; }
-        git clone --depth=1 https://github.com/enp1s0/cutf "$OZIMMU_DIR/src/cutf" >> "$LOGFILE" 2>&1 \
-            || { log "WARNING: cutf clone failed."; }
-    fi
-    if [ -d "$OZIMMU_DIR" ]; then
-        log "Building ozIMMU..."
-        cmake -S "$OZIMMU_DIR" -B "$OZIMMU_DIR/build" \\
-            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local \\
-            -DAUTO_SUBMODULE_UPDATE=OFF \\
-            -DBUILD_TEST=OFF \\
-            >> "$LOGFILE" 2>&1 \\
-            && cmake --build "$OZIMMU_DIR/build" -j$(nproc) >> "$LOGFILE" 2>&1 \\
-            && cmake --install "$OZIMMU_DIR/build" >> "$LOGFILE" 2>&1 \\
-            && echo '/usr/local/cuda/lib64' > /etc/ld.so.conf.d/cuda-ozaki.conf \\
-            && echo '/usr/local/lib' >> /etc/ld.so.conf.d/cuda-ozaki.conf \\
-            && ldconfig >> "$LOGFILE" 2>&1 \\
-            && log "ozIMMU installed and ldconfig updated." \\
-            || log "WARNING: ozIMMU build failed (Ozaki binary will not be available)."
+        log "ozIMMU already installed, skipping build."
     fi
 else
-    log "ozIMMU already installed, skipping build."
+    log "Skipping ozIMMU build (using cuBLAS native emulation)."
 fi
 
 # ── Unpack sources from mount ──────────────────────────────────────────────

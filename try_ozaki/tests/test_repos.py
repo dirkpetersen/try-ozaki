@@ -205,7 +205,8 @@ def test_ozaki_simple_rewritten(tmp_path):
 
     assert len(modified) >= 1
     assert (work / "ozaki_wrapper.f90").exists(), "ozaki_wrapper.f90 not generated"
-    assert (work / "ozaki_wrapper.cpp").exists(), "ozaki_wrapper.cpp not generated"
+    assert (work / "ozaki_wrapper_ozimmu.cpp").exists(), "ozaki_wrapper_ozimmu.cpp not generated"
+    assert (work / "ozaki_wrapper_cublas.cpp").exists(), "ozaki_wrapper_cublas.cpp not generated"
 
     src = (work / "matmul_fp64.f90").read_text()
     assert "OZAKI_DGEMM" in src, "Expected OZAKI_DGEMM call in rewritten file"

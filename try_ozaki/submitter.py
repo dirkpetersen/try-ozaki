@@ -6,11 +6,12 @@ import sys
 import time
 from pathlib import Path
 
+from .claude_runner import _build_env
 from .config import RUNAI_PROJECT, RUNAI_IMAGE, GPU_REQUEST, JOB_TIMEOUT_SECS, JOB_POLL_INTERVAL, RUNAI_DATASOURCE
 
 
 def _run(cmd: list[str], check: bool = True, capture: bool = False) -> subprocess.CompletedProcess:
-    kwargs: dict = {"check": check}
+    kwargs: dict = {"check": check, "env": _build_env()}
     if capture:
         kwargs["capture_output"] = True
         kwargs["text"] = True
@@ -127,7 +128,7 @@ def stream_logs(job_name: str, project: str = RUNAI_PROJECT) -> None:
     """Stream job logs to stdout (blocking)."""
     subprocess.run(
         ["runai", "workload", "logs", job_name, "-p", project, "--follow"],
-        check=False,
+        check=False, env=_build_env(),
     )
 
 

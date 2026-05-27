@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>try-ozaki</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 860px; margin: 2rem auto; padding: 0 1rem; background: #0f0f0f; color: #e0e0e0; }
+    h1 { font-size: 1.6rem; font-weight: 700; color: #7ee8a2; margin-bottom: 0.25rem; }
+    p.subtitle { color: #888; margin-top: 0; font-size: 0.9rem; }
+    label { display: block; font-size: 0.85rem; color: #aaa; margin-bottom: 0.25rem; margin-top: 1rem; }
+    input, select { width: 100%; padding: 0.5rem 0.75rem; background: #1e1e1e; border: 1px solid #333; border-radius: 6px; color: #e0e0e0; font-size: 0.95rem; box-sizing: border-box; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+    button { margin-top: 1.25rem; width: 100%; padding: 0.65rem; background: #2a6b3c; border: none; border-radius: 6px; color: #fff; font-size: 1rem; cursor: pointer; font-weight: 600; }
+    button:hover { background: #3a8b4f; }
+    button:disabled { background: #333; color: #666; cursor: default; }
+    #log { margin-top: 1.5rem; background: #111; border: 1px solid #2a2a2a; border-radius: 6px; padding: 1rem; font-family: monospace; font-size: 0.82rem; min-height: 120px; max-height: 520px; overflow-y: auto; white-space: pre-wrap; word-break: break-all; }
+    .ev-stage     { color: #7ee8a2; font-weight: bold; }
+    .ev-status    { color: #aaddff; }
+    .ev-chunk     { color: #e0e0e0; }
+    .ev-log_line  { color: #888; }
+    .ev-job_status{ color: #f0c040; }
+    .ev-report    { color: #7ee8a2; white-space: pre; }
+    .ev-error     { color: #ff6b6b; }
+    .ev-done      { color: #888; }
+    #status-bar { margin-top: 0.75rem; font-size: 0.82rem; color: #666; min-height: 1.2em; }
+  </style>
+</head>
+<body>
+  <h1>try-ozaki</h1>
+  <p class="subtitle">Automated FP64 → Ozaki Scheme rewrite and GPU validation</p>
+
+  <label>GitHub URL or local path</label>
+  <input id="source" placeholder="https://github.com/user/repo  or  /path/to/code" />
+
+  <div class="row">
+    <div>
+      <label>Run:ai project</label>
+      <input id="project" placeholder="osu-default" />
+    </div>
+    <div>
+      <label>Error tolerance</label>
+      <input id="tolerance" placeholder="1e-6" value="1e-6" />
+    </div>
+  </div>
+
+  <div class="row">
+    <div>
+      <label>Container image</label>
+      <input id="image" placeholder="(default)" />
+    </div>
+    <div>
+      <label>Mode</label>
+      <select id="mode">
+        <option value="full">Full pipeline (analyze → rewrite → GPU → results)</option>
+        <option value="no_submit">No submit (analyze + rewrite only)</option>
+        <option value="dry_run">Dry run (analyze only)</option>
+      </select>
+    </div>
+  </div>
+
+  <button id="run-btn" onclick="runPipeline()">Run</button>
+
+  <div id="status-bar"></div>
+  <div id="log"></div>
+
+  <script>
+    let es = null;
+
+    function runPipeline() {
+      const source = document.getElementById('source').value.trim();
+      if (!source) { alert('Enter a GitHub URL or local path.'); return; }
+
+      const log = document.getElementById('log');
+      log.innerHTML = '';
+      document.getElementById('status-bar').textContent = '';
+      document.getElementById('run-btn').disabled = true;
+
+      const params = new URLSearchParams({
+        source,
+        project:   document.getElementById('project').value.trim(),
+        tolerance: document.getElementById('tolerance').value.trim() || '1e-6',
+        image:     document.getElementById('image').value.trim(),
+        mode:      document.getElementById('mode').value,
+      });
+
+      if (es) es.close();
+      es = new EventSource('/evaluate?' + params.toString());
+
+      function append(cls, text) {
+        const line = document.createElement('div');
+        line.className = 'ev-' + cls;
+        line.textContent = text;
+        log.appendChild(line);
+        log.scrollTop = log.scrollHeight;
+      }
+
+      for (const kind of ['status','stage','chunk','log_line','job_status','report','error','done']) {
+        es.addEventListener(kind, e => {
+          const data = e.data;
+          if (kind === 'job_status') {
+            try {
+              const d = JSON.parse(data);
+              document.getElementById('status-bar').textContent =
+                `Job ${d.job_id} — ${d.phase}${d.node ? ' on ' + d.node : ''}`;
+            } catch {}
+            return;
+          }
+          if (kind === 'done') {
+            es.close();
+            document.getElementById('run-btn').disabled = false;
+            document.getElementById('status-bar').textContent =
+              data === 'pass' ? '✓ PASS' : data === 'fail' ? '✗ FAIL' : 'Done';
+            return;
+          }
+          if (data) append(kind, data);
+        });
+      }
+
+      es.onerror = () => {
+        append('error', 'Connection lost.');
+        document.getElementById('run-btn').disabled = false;
+        es.close();
+      };
+    }
+  </script>
+</body>
+</html>

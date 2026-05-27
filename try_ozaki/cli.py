@@ -1,211 +1,74 @@
 """try-ozaki CLI entry point.
 
 Usage:
-    try-ozaki <local-path> [--tolerance 1e-6] [--project osu-default]
-              [--no-submit] [--dry-run]
+    try-ozaki <local-path> [options]
+
+Drives the shared pipeline generator and prints events to stdout in real time.
 """
 
 import argparse
-import shutil
+import asyncio
 import sys
-import tarfile
-import tempfile
-import uuid
 from pathlib import Path
 
-import boto3
 
-from .analyzer import analyze, Hotspot
-from .config import (
-    RUNAI_PROJECT, RUNAI_IMAGE, S3_BUCKET, S3_REGION, S3_PREFIX,
-    RUNAI_DATASOURCE, DATASOURCE_MOUNT, RESULTS_BASE,
-)
-from .job_script import generate as gen_script
-from .rewriter import rewrite
-from .results import collect, report
-from .submitter import delete_job, stream_logs, submit_job, wait_for_job
-
-
-def _pack_sources(original_dir: Path, ozaki_dir: Path, dest: Path) -> None:
-    with tarfile.open(dest, "w:gz") as tar:
-        tar.add(original_dir, arcname="src/original")
-        tar.add(ozaki_dir, arcname="src/ozaki")
-
-
-def _pack_ozimmu(ozimmu_local: Path, dest: Path) -> bool:
-    """Pack the locally cloned ozIMMU+cutf tree into ozimmu.tar.gz.
-    Returns True if the archive was created, False if the source dir is missing.
-    """
-    if not ozimmu_local.is_dir():
-        return False
-    with tarfile.open(dest, "w:gz") as tar:
-        tar.add(ozimmu_local, arcname="ozIMMU")
-    return True
-
-
-def _ensure_ozimmu_local(cache_dir: Path) -> Path:
-    """Return a local clone of ozIMMU+cutf, fetching via gh CLI if not cached."""
-    ozimmu_dir = cache_dir / "ozIMMU"
-    if (ozimmu_dir / "CMakeLists.txt").exists():
-        return ozimmu_dir
-
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    print("[try-ozaki] Cloning ozIMMU + cutf (one-time, cached)...", flush=True)
-    import subprocess
-    subprocess.run(
-        ["gh", "repo", "clone", "enp1s0/ozIMMU", str(ozimmu_dir), "--", "--depth=1"],
-        check=True, capture_output=True,
-    )
-    subprocess.run(
-        ["gh", "repo", "clone", "enp1s0/cutf", str(ozimmu_dir / "src" / "cutf"), "--", "--depth=1"],
-        check=True, capture_output=True,
-    )
-    return ozimmu_dir
-
-
-def _upload_s3(local_path: Path, bucket: str, key: str, region: str = "us-east-1") -> None:
-    s3 = boto3.client("s3", region_name=region)
-    s3.upload_file(str(local_path), bucket, key)
-    print(f"[try-ozaki] Uploaded s3://{bucket}/{key}", flush=True)
-
-
-def run(
-    source_path: Path,
-    project: str = RUNAI_PROJECT,
-    image: str = RUNAI_IMAGE,
-    s3_bucket: str = S3_BUCKET,
-    s3_region: str = S3_REGION,
-    s3_prefix: str = S3_PREFIX,
-    datasource: str = RUNAI_DATASOURCE,
-    datasource_mount: str = DATASOURCE_MOUNT,
-    tolerance: float = 1e-6,
-    no_submit: bool = False,
-    dry_run: bool = False,
-    cmake_flags: str = "",
-) -> int:
-    """Main pipeline. Returns exit code (0=pass, 1=fail/error)."""
-
-    source_path = source_path.resolve()
-    job_id = f"ozaki-{uuid.uuid4().hex[:8]}"
-    print(f"[try-ozaki] Job ID : {job_id}", flush=True)
-    print(f"[try-ozaki] Source : {source_path}", flush=True)
-
-    # ── 1. Analyze ────────────────────────────────────────────────────────────
-    print("[try-ozaki] Stage 1: Analyzing FP64 hotspots...", flush=True)
-    hotspots = analyze(source_path)
-    if not hotspots:
-        print("[try-ozaki] No FP64 hotspots found. Nothing to do.", flush=True)
-        return 0
-
-    print(f"[try-ozaki] Found {len(hotspots)} hotspot(s):", flush=True)
-    for h in hotspots:
-        rel = h.file.relative_to(source_path)
-        print(f"  {rel}:{h.start_line}  [{h.kind}]  ({h.language})", flush=True)
-
-    if dry_run:
-        print("[try-ozaki] --dry-run: stopping after analysis.", flush=True)
-        return 0
-
-    # ── 2. Prepare working dirs ───────────────────────────────────────────────
-    work_dir = Path(tempfile.mkdtemp(prefix=f"try-ozaki-{job_id}-"))
-    orig_dir = work_dir / "original"
-    ozaki_dir = work_dir / "ozaki"
-    shutil.copytree(source_path, orig_dir)
-    shutil.copytree(source_path, ozaki_dir)
-
-    ozaki_hotspots = [
-        Hotspot(
-            file=ozaki_dir / h.file.relative_to(source_path),
-            kind=h.kind, language=h.language,
-            start_line=h.start_line, end_line=h.end_line,
-            context=h.context, vars=h.vars,
-        )
-        for h in hotspots
-    ]
-
-    # ── 3. Rewrite ────────────────────────────────────────────────────────────
-    print("[try-ozaki] Stage 2: Rewriting hotspots...", flush=True)
-    modified = rewrite(ozaki_dir, ozaki_hotspots)
-    for m in modified:
-        print(f"  Modified: {m.relative_to(ozaki_dir)}", flush=True)
-
-    if no_submit:
-        print(f"[try-ozaki] --no-submit: rewritten sources at {ozaki_dir}", flush=True)
-        return 0
-
-    # ── 4. Pack & upload to S3 (app host uses its own AWS creds) ─────────────
-    print("[try-ozaki] Stage 3: Uploading sources to S3...", flush=True)
-    archive = work_dir / "src.tar.gz"
-    _pack_sources(orig_dir, ozaki_dir, archive)
-    job_s3_prefix = f"{s3_prefix}/{job_id}"
-    _upload_s3(archive, s3_bucket, f"{job_s3_prefix}/src.tar.gz", region=s3_region)
-
-    # Bundle ozIMMU + cutf so the worker doesn't need internet access
-    ozimmu_cache = Path.home() / ".cache" / "try-ozaki" / "ozIMMU"
+def _load_dotenv() -> None:
+    """Load .env files: project root first, then user override wins."""
     try:
-        ozimmu_local = _ensure_ozimmu_local(ozimmu_cache.parent)
-        ozimmu_archive = work_dir / "ozimmu.tar.gz"
-        if _pack_ozimmu(ozimmu_local, ozimmu_archive):
-            _upload_s3(ozimmu_archive, s3_bucket, f"{job_s3_prefix}/ozimmu.tar.gz", region=s3_region)
-    except Exception as e:
-        print(f"[try-ozaki] Warning: could not bundle ozIMMU ({e}); worker will attempt git clone.", flush=True)
+        from dotenv import load_dotenv
+        load_dotenv()                                                      # ./.env
+        load_dotenv(Path.home() / ".try-ozaki" / ".env", override=True)   # user wins
+    except ImportError:
+        pass
 
-    # ── 5. Generate & upload job script ──────────────────────────────────────
-    script_content = gen_script(
-        job_id=job_id,
-        s3_prefix=s3_prefix,
-        datasource_mount=datasource_mount,
-        cmake_flags=cmake_flags,
+
+def _load_config():
+    from .config import (
+        RUNAI_PROJECT, RUNAI_IMAGE, S3_BUCKET, S3_REGION, S3_PREFIX,
+        RUNAI_DATASOURCE, DATASOURCE_MOUNT,
     )
-    script_path = work_dir / "job.sh"
-    script_path.write_text(script_content)
-    _upload_s3(script_path, s3_bucket, f"{job_s3_prefix}/job.sh", region=s3_region)
-
-    # ── 6. Submit job (datasource provides S3 mount, no creds in container) ──
-    print("[try-ozaki] Stage 4: Submitting GPU job...", flush=True)
-    # Worker reads job.sh from the mount, no aws CLI needed
-    inline_cmd = f"bash {datasource_mount}/{s3_prefix}/{job_id}/job.sh"
-
-    submit_job(
-        job_name=job_id,
-        inline_command=inline_cmd,
-        project=project,
-        image=image,
-        gpu=1,
-        datasource=datasource,
+    return dict(
+        project=RUNAI_PROJECT, image=RUNAI_IMAGE,
+        s3_bucket=S3_BUCKET, s3_region=S3_REGION, s3_prefix=S3_PREFIX,
+        datasource=RUNAI_DATASOURCE, datasource_mount=DATASOURCE_MOUNT,
     )
 
-    # ── 7. Wait for completion ────────────────────────────────────────────────
-    print("[try-ozaki] Stage 5: Waiting for job completion...", flush=True)
-    final_status = wait_for_job(job_id, project=project)
-    print(f"[try-ozaki] Final status: {final_status}", flush=True)
 
-    # ── 8. Collect & validate results ────────────────────────────────────────
-    print("[try-ozaki] Stage 6: Collecting results from S3...", flush=True)
-    results_dir = RESULTS_BASE / job_id
-    validation = collect(
-        job_id=job_id,
-        runai_status=final_status,
-        s3_bucket=s3_bucket,
-        s3_prefix=s3_prefix,
-        s3_region=s3_region,
-        local_dir=results_dir,
-        error_tolerance=tolerance,
-    )
+async def _drive(args: argparse.Namespace) -> int:
+    from .events import terminal_format
+    from .pipeline import run_pipeline
 
-    print(report(validation), flush=True)
+    cfg = _load_config()
 
-    log_file = results_dir / "job.log"
-    if log_file.exists():
-        print("\n[try-ozaki] ── Worker log (last 40 lines) ──────────────────", flush=True)
-        for line in log_file.read_text(errors="replace").splitlines()[-40:]:
+    exit_code = 0
+    async for event in run_pipeline(
+        source_path=args.path,
+        project=args.project or cfg["project"],
+        image=args.image or cfg["image"],
+        s3_bucket=args.s3_bucket or cfg["s3_bucket"],
+        s3_region=args.s3_region or cfg["s3_region"],
+        s3_prefix=args.s3_prefix or cfg["s3_prefix"],
+        datasource=args.datasource or cfg["datasource"],
+        datasource_mount=args.datasource_mount or cfg["datasource_mount"],
+        tolerance=args.tolerance,
+        no_submit=args.no_submit,
+        dry_run=args.dry_run,
+        cmake_flags=args.cmake_flags,
+    ):
+        line = terminal_format(event)
+        if line is not None:
             print(line, flush=True)
+        if event.kind == "done" and event.data == "fail":
+            exit_code = 1
+        if event.kind == "error":
+            exit_code = 1
 
-    shutil.rmtree(work_dir, ignore_errors=True)
-    return 0 if validation.passed else 1
+    return exit_code
 
 
 def main() -> None:
+    _load_dotenv()
+
     parser = argparse.ArgumentParser(
         prog="try-ozaki",
         description="Rewrite FP64 hotspots with the Ozaki Scheme and validate on GPU.",
@@ -213,20 +76,20 @@ def main() -> None:
     parser.add_argument("path", type=Path, help="Local source directory to analyze")
     parser.add_argument("--tolerance", type=float, default=1e-6,
                         help="Max relative error threshold (default: 1e-6)")
-    parser.add_argument("--project", default=RUNAI_PROJECT,
-                        help=f"Run:ai project (default: {RUNAI_PROJECT})")
-    parser.add_argument("--image", default=RUNAI_IMAGE,
+    parser.add_argument("--project", default="",
+                        help="Run:ai project (overrides config default)")
+    parser.add_argument("--image", default="",
                         help="Container image for GPU worker")
-    parser.add_argument("--s3-bucket", default=S3_BUCKET,
-                        help=f"S3 bucket (default: {S3_BUCKET})")
-    parser.add_argument("--s3-region", default=S3_REGION,
-                        help=f"S3 region (default: {S3_REGION})")
-    parser.add_argument("--s3-prefix", default=S3_PREFIX,
-                        help=f"S3 key prefix (default: {S3_PREFIX})")
-    parser.add_argument("--datasource", default=RUNAI_DATASOURCE,
-                        help=f"Run:ai datasource name (default: {RUNAI_DATASOURCE})")
-    parser.add_argument("--datasource-mount", default=DATASOURCE_MOUNT,
-                        help=f"Mount path inside container (default: {DATASOURCE_MOUNT})")
+    parser.add_argument("--s3-bucket", default="",
+                        help="S3 bucket for job artifacts")
+    parser.add_argument("--s3-region", default="",
+                        help="S3 region")
+    parser.add_argument("--s3-prefix", default="",
+                        help="S3 key prefix")
+    parser.add_argument("--datasource", default="",
+                        help="Run:ai datasource name")
+    parser.add_argument("--datasource-mount", default="",
+                        help="Mount path inside container")
     parser.add_argument("--cmake-flags", default="",
                         help="Extra CMake flags for worker builds")
     parser.add_argument("--no-submit", action="store_true",
@@ -240,20 +103,7 @@ def main() -> None:
         print(f"[try-ozaki] Error: '{args.path}' is not a directory.", file=sys.stderr)
         sys.exit(2)
 
-    sys.exit(run(
-        source_path=args.path,
-        project=args.project,
-        image=args.image,
-        s3_bucket=args.s3_bucket,
-        s3_region=args.s3_region,
-        s3_prefix=args.s3_prefix,
-        datasource=args.datasource,
-        datasource_mount=args.datasource_mount,
-        tolerance=args.tolerance,
-        no_submit=args.no_submit,
-        dry_run=args.dry_run,
-        cmake_flags=args.cmake_flags,
-    ))
+    sys.exit(asyncio.run(_drive(args)))
 
 
 if __name__ == "__main__":
